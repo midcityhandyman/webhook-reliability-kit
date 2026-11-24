@@ -8,6 +8,7 @@ import sys
 from dataclasses import replace
 
 from .chaos import ChaosConfig, ChaosReport, run_scenario
+from .db import connect
 
 
 def _money(cents: int) -> str:
@@ -49,6 +50,16 @@ def _print_report(title: str, report: ChaosReport, log_lines: int) -> None:
     print()
 
 
+def _has_events(path: str) -> bool:
+    if path == ":memory:" or not os.path.exists(path):
+        return False
+    conn = connect(path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM inbox_events").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
 def demo(seed: int, events: int, log_lines: int) -> int:
     config = ChaosConfig(
         seed=seed,
@@ -57,6 +68,13 @@ def demo(seed: int, events: int, log_lines: int) -> int:
         outbound_secret=os.environ.get("WEBHOOK_KIT_OUTBOUND_SECRET", ChaosConfig.outbound_secret),
         db_path=os.environ.get("WEBHOOK_KIT_DB", ChaosConfig.db_path),
     )
+    if _has_events(config.db_path):
+        # The fake downstream ledger is in memory and starts empty each run, so
+        # a sender database left over from an earlier run would dedupe every
+        # event and report a failure that is not real.
+        print(f"WEBHOOK_KIT_DB={config.db_path} already holds events from an earlier run.")
+        print("Delete it or point at a new file, then run the demo again.")
+        return 2
     print(f"webhook-reliability-kit chaos demo (seed={seed}, events={events})")
     print(
         f"downstream fails before applying {config.p_fail_before:.0%} of calls, "

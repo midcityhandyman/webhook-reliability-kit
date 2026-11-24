@@ -35,6 +35,7 @@ class DrainStats:
     sent: int = 0
     retried: int = 0
     dead: int = 0
+    stale: int = 0  # results thrown away because the lease was lost mid call
     events: List[str] = field(default_factory=list)
 
     def add(self, other: "DrainStats") -> None:
@@ -42,6 +43,7 @@ class DrainStats:
         self.sent += other.sent
         self.retried += other.retried
         self.dead += other.dead
+        self.stale += other.stale
         self.events.extend(other.events)
 
 
@@ -121,6 +123,31 @@ def _claim(conn: sqlite3.Connection, now: float, batch: int, lease_seconds: floa
     return rows
 
 
+def _settle(conn, row, now, outcome, set_sql, params, error=None) -> bool:
+    """Record the result of one attempt, but only if this worker still holds
+    the claim. If the call outlived its lease, another worker has taken the
+    row (or already finished it) and a late write here could flip a sent row
+    back to pending or dead. attempts plus lease_expires_at identify the claim.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            f"""UPDATE outbox SET lease_expires_at = NULL, {set_sql}
+                WHERE id = ? AND status = 'in_flight' AND attempts = ? AND lease_expires_at = ?""",
+            (*params, row["id"], row["attempts"], row["lease_expires_at"]),
+        )
+        if cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            return False
+        _log(conn, row["id"], row["attempts"], now, outcome, error)
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    return True
+
+
 def drain_once(
     conn: sqlite3.Connection,
     send: SendFn,
@@ -134,7 +161,10 @@ def drain_once(
 
     send(row) must raise an Exception on failure. The attempt counter is
     bumped at claim time, before the call, so a crash mid call still counts
-    against the budget.
+    against the budget. The budget is the row's own max_attempts, set at
+    enqueue; policy.max_attempts is not read here, only the delay settings.
+    The lease runs from `now` for the whole batch, so it has to outlast every
+    call in the batch, not just one.
     """
     stats = DrainStats()
     rows = _claim(conn, now, batch, lease_seconds, stats)
@@ -145,40 +175,28 @@ def drain_once(
         except Exception as exc:  # WorkerCrash passes straight through
             error = f"{type(exc).__name__}: {exc}"[:500]
             if row["attempts"] >= row["max_attempts"]:
-                conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
-                    "UPDATE outbox SET status = 'dead', lease_expires_at = NULL, last_error = ? WHERE id = ?",
-                    (error, row["id"]),
-                )
-                _log(conn, row["id"], row["attempts"], now, "dead", error)
-                conn.execute("COMMIT")
-                stats.dead += 1
-                stats.events.append(f"row {row['id']} dead after {row['attempts']} attempts ({error})")
+                if _settle(conn, row, now, "dead", "status = 'dead', last_error = ?", (error,), error):
+                    stats.dead += 1
+                    stats.events.append(f"row {row['id']} dead after {row['attempts']} attempts ({error})")
+                    continue
             else:
                 delay = next_delay(policy, row["attempts"], rng)
-                conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
-                    """UPDATE outbox SET status = 'pending', lease_expires_at = NULL,
-                                         next_attempt_at = ?, last_error = ? WHERE id = ?""",
-                    (now + delay, error, row["id"]),
-                )
-                _log(conn, row["id"], row["attempts"], now, "retry", error)
-                conn.execute("COMMIT")
-                stats.retried += 1
-                stats.events.append(
-                    f"row {row['id']} attempt {row['attempts']} failed, retry in {delay:.2f}s ({error})"
-                )
+                if _settle(
+                    conn, row, now, "retry",
+                    "status = 'pending', next_attempt_at = ?, last_error = ?", (now + delay, error), error,
+                ):
+                    stats.retried += 1
+                    stats.events.append(
+                        f"row {row['id']} attempt {row['attempts']} failed, retry in {delay:.2f}s ({error})"
+                    )
+                    continue
         else:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                """UPDATE outbox SET status = 'sent', lease_expires_at = NULL,
-                                     sent_at = ?, last_error = NULL WHERE id = ?""",
-                (now, row["id"]),
-            )
-            _log(conn, row["id"], row["attempts"], now, "sent")
-            conn.execute("COMMIT")
-            stats.sent += 1
-            stats.events.append(f"row {row['id']} sent on attempt {row['attempts']}")
+            if _settle(conn, row, now, "sent", "status = 'sent', sent_at = ?, last_error = NULL", (now,)):
+                stats.sent += 1
+                stats.events.append(f"row {row['id']} sent on attempt {row['attempts']}")
+                continue
+        stats.stale += 1
+        stats.events.append(f"row {row['id']} attempt {row['attempts']} result discarded (lease lost)")
     return stats
 
 

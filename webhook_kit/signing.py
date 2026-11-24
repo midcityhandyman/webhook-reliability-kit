@@ -57,10 +57,11 @@ def verify(
     if abs(now - timestamp) > tolerance_seconds:
         raise SignatureError("timestamp is outside the tolerance window")
     for secret in secrets:
-        expected = _digest(secret, timestamp, body)
+        expected = _digest(secret, timestamp, body).encode("ascii")
         for candidate in candidates:
             # compare_digest runs in constant time, so the check does not leak
-            # how many leading characters matched.
-            if hmac.compare_digest(expected, candidate):
+            # how many leading characters matched. Compare bytes: on str it
+            # raises TypeError for non ASCII input, and the header is untrusted.
+            if hmac.compare_digest(expected, candidate.encode("utf-8")):
                 return timestamp
     raise SignatureError("signature does not match")

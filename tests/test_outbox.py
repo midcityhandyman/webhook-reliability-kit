@@ -123,3 +123,33 @@ def test_two_workers_never_claim_the_same_row(tmp_path):
     assert sorted(seen) == list(range(1, 21))
     a.close()
     b.close()
+
+
+def test_late_result_from_a_worker_that_lost_its_lease_is_discarded(tmp_path):
+    """Worker A's call outlives its lease. Worker B reclaims the row and
+    delivers it. A's late failure must not flip the sent row back to pending."""
+    path = str(tmp_path / "shared.db")
+    a, b = connect(path), connect(path)
+    enqueue(a, "k1", "ledger", "{}", NOW, POLICY.max_attempts)
+
+    def slow_then_fail(_row):
+        # While A is still inside its call, the lease expires and B takes over.
+        stats_b = drain_once(b, lambda r: None, NOW + 31, random.Random(0), POLICY)
+        assert stats_b.sent == 1
+        raise ConnectionError("timed out")
+
+    stats_a = drain_once(a, slow_then_fail, NOW, random.Random(0), POLICY, lease_seconds=30)
+    assert (stats_a.stale, stats_a.retried, stats_a.dead) == (1, 0, 0)
+    assert row(a)["status"] == "sent" and row(a)["attempts"] == 2
+    outcomes = [x["outcome"] for x in a.execute("SELECT outcome FROM delivery_attempts ORDER BY id")]
+    assert outcomes == ["sent"]
+    a.close()
+    b.close()
+
+
+def test_budget_comes_from_the_row_not_the_drain_policy():
+    conn = connect()
+    clock = FakeClock(NOW)
+    enqueue(conn, "k1", "ledger", "{}", NOW, 2)
+    stats = run_until_idle(conn, fail, clock, random.Random(0), BackoffPolicy(max_attempts=9))
+    assert stats.dead == 1 and row(conn)["attempts"] == 2

@@ -43,3 +43,8 @@ def test_secret_rotation_accepts_old_and_new():
 def test_malformed_headers_are_rejected(header):
     with pytest.raises(SignatureError):
         verify(SECRET, BODY, header, NOW)
+
+
+def test_non_ascii_digest_is_a_signature_error_not_a_crash():
+    with pytest.raises(SignatureError, match="match"):
+        verify(SECRET, BODY, f"t={int(NOW)},v1=é", NOW)
