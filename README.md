@@ -49,7 +49,7 @@ flowchart LR
 
 ## Run it
 
-Needs Python 3.9 or newer. Nothing to install for the demo.
+Needs Python 3.10 or newer. Nothing to install for the demo.
 
 ```
 python demo/run_demo.py
