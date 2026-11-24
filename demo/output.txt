@@ -1,0 +1,62 @@
+webhook-reliability-kit chaos demo (seed=7, events=60)
+downstream fails before applying 30% of calls, loses the response after applying 20%, worker crashes after 5% of successful calls
+
+Run 1: downstream dedupes on the idempotency key
+------------------------------------------------
+  inbound deliveries        100
+    accepted                60
+    deduped redeliveries    34
+    rejected bad signature  6
+  downstream calls          118
+    retries scheduled       53
+    worker crashes          2
+    dead lettered           4 (max 4 attempts)
+    replayed after heal     4
+    duplicates suppressed   17
+  final outbox status       {'sent': 60}
+  first 8 worker log lines:
+    row 1 attempt 1 failed, retry in 0.57s (DownstreamError: timeout, effect applied but response lost)
+    row 2 attempt 1 failed, retry in 0.11s (DownstreamError: timeout, effect applied but response lost)
+    row 3 sent on attempt 1
+    row 4 attempt 1 failed, retry in 0.19s (DownstreamError: 503 unavailable, nothing applied)
+    row 5 attempt 1 failed, retry in 0.62s (DownstreamError: 503 unavailable, nothing applied)
+    row 6 attempt 1 failed, retry in 0.32s (DownstreamError: 503 unavailable, nothing applied)
+    row 7 sent on attempt 1
+    row 8 attempt 1 failed, retry in 0.22s (DownstreamError: 503 unavailable, nothing applied)
+  first log line of each other kind:
+    worker crashed (killed after the downstream replied, before the row was marked sent), restarting
+    row 54 dead after 4 attempts (DownstreamError: 503 unavailable, nothing applied)
+    downstream healed, replayed 4 dead rows
+  ledger check (account: expected / actual):
+    acct_demo_01: 549.12 / 549.12  ok
+    acct_demo_02: 766.45 / 766.45  ok
+    acct_demo_03: 628.83 / 628.83  ok
+    acct_demo_04: 540.77 / 540.77  ok
+    acct_demo_05: 491.89 / 491.89  ok
+  effects missing: 0   effects applied twice or more: 0
+  exactly once: YES
+
+Run 2: same seed, downstream ignores the key (control)
+------------------------------------------------------
+  inbound deliveries        100
+    accepted                60
+    deduped redeliveries    34
+    rejected bad signature  6
+  downstream calls          118
+    retries scheduled       53
+    worker crashes          2
+    dead lettered           4 (max 4 attempts)
+    replayed after heal     4
+    duplicates suppressed   0
+  final outbox status       {'sent': 60}
+  ledger check (account: expected / actual):
+    acct_demo_01: 549.12 / 766.36  WRONG by 217.24
+    acct_demo_02: 766.45 / 902.01  WRONG by 135.56
+    acct_demo_03: 628.83 / 665.09  WRONG by 36.26
+    acct_demo_04: 540.77 / 938.80  WRONG by 398.03
+    acct_demo_05: 491.89 / 680.10  WRONG by 188.21
+  effects missing: 0   effects applied twice or more: 14
+  exactly once: NO
+
+Same traffic and same failures in both runs. Retries are unavoidable;
+the idempotency key is what turns at least once delivery into exactly once effects.
